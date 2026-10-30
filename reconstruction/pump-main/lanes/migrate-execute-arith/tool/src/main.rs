@@ -277,7 +277,7 @@ fn is_unsigned_guard(op: u8) -> bool {
     matches!(mnemonic(op), Some("jgt") | Some("jge") | Some("jlt") | Some("jle"))
 }
 
-fn census(insns: &[Insn], data: &[u8], offset: u64) -> serde_style::Census {
+fn census(insns: &[Insn], data: &[u8], offset: u64, vaddr: u64) -> serde_style::Census {
     let mut histogram: Vec<(String, u32)> = Vec::new();
     let mut checked = Vec::new();
     let mut saturating = Vec::new();
@@ -296,11 +296,11 @@ fn census(insns: &[Insn], data: &[u8], offset: u64) -> serde_style::Census {
         }
 
         if ins.opcode == 0x18 {
-            let hi = u32::from_le_bytes(
-                data[(offset + (index as u64) * 8 + 12) as usize..(offset + (index as u64) * 8 + 16) as usize]
-                    .try_into()
-                    .unwrap(),
-            );
+            // The high word of an lddw sits in the paired slot 12 bytes into
+            // the 16-byte instruction; derive it from the instruction's own
+            // address, not an instruction index (lddw slots are 16 bytes).
+            let hi_at = offset + (ins.vaddr - vaddr) + 12;
+            let hi = u32::from_le_bytes(data[hi_at as usize..hi_at as usize + 4].try_into().unwrap());
             let full = (ins.imm as u64) | ((hi as u64) << 32);
             let low32 = full & 0xFFFFFFFF;
             if (6000..7000).contains(&low32) {
@@ -312,6 +312,15 @@ fn census(insns: &[Insn], data: &[u8], offset: u64) -> serde_style::Census {
         }
         if ins.opcode == 0xb7 && (6000..7000).contains(&(ins.imm)) {
             error_constants.push(format!("{:#x}: mov {}", ins.vaddr, ins.imm));
+        }
+        if matches!(ins.opcode, 0x62 | 0x7a | 0x72 | 0x6a) && (6000..7000).contains(&(ins.imm)) {
+            let width = match ins.opcode {
+                0x62 => "stw32",
+                0x7a => "stdw64",
+                0x72 => "stb8",
+                _ => "sth16",
+            };
+            error_constants.push(format!("{:#x}: store {} {}", ins.vaddr, width, ins.imm));
         }
 
         if let Some((opname, _width)) = arith_op(ins.opcode) {
@@ -509,7 +518,7 @@ fn main() -> ExitCode {
         eprintln!("writing listing failed: {e}");
         return ExitCode::FAILURE;
     }
-    let report = census(&insns, &data, offset);
+    let report = census(&insns, &data, offset, vaddr);
     let listing_ref = args[5].replace('\\', "/");
     let json = report.to_json((vaddr, length), &seal, &listing_ref);
     if let Err(e) = fs::write(&args[6], json) {

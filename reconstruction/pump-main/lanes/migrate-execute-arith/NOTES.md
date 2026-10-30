@@ -6,30 +6,22 @@ handlers — and no committed lane documented its arithmetic semantics. This lan
 is a static opcode census of the committed capture; it builds nothing and runs
 nothing from the binary.
 
-Approach: decode the window straight from `evidence/original/pump/deployed.so`
-with a Rust decoder and classify the arithmetic shapes.
+## Corrections
 
-## Correction of the first pass (commit b93f2a708)
-
-The first version of this lane claimed the window's odd opcodes
-(`0x1d/0x2d/0x3d/0x5d/0xad`) were a SBF reassignment of the eBPF register-jump
-family to 128-bit ALU operations, and committed a Python tool plus a
-`census.json` that was in fact a Python traceback. Both were wrong.
-
-- **Encoding.** The standard eBPF/SBF reading is correct: those opcodes are
-  register-form conditional jumps (`jeq r2, r3, +1`, `jlt r6, r0, +1`, …). The
-  SBF VM's own opcode definitions keep both immediate and register jump forms
-  (`JEQ64_REG`, `JLT64_REG`, … in the `ebpf` module of the sbpf VM). The
-  control-flow test settles it locally too: under the standard reading the
-  exhibit at `0x78e28` (`jlt r6, r0, +1` skipping `mov r1, 0`) leaves the
-  following branch live — a working overflow guard — while the ALU128 reading
-  would make that branch dead code. Raw bytes at `0x78e28`
-  (`ad 06 01 00 00 00 00 00`) are an ordinary register jump.
-- **Artifact.** The committed `census.json` was a traceback because a shell
-  redirection captured a failing run. The Rust tool below writes its output
-  files directly and was run twice with byte-identical results.
-
-The erroneous "SBF ALU128 reassignment" claim is retracted in full.
+1. **First pass (b93f2a708).** Claimed the window's odd opcodes were a SBF
+   reassignment of the eBPF register-jump family to 128-bit ALU operations, and
+   committed a `census.json` that was a Python traceback. Both retracted: the
+   standard eBPF/SBF encoding with register-form jumps is correct (the sbpf
+   VM's own `JEQ64_REG`/`JLT64_REG` definitions; the `0x78e28` control-flow
+   test leaves the guard branch live under the standard reading and dead under
+   the reassignment reading), and the census now writes its own artifacts.
+2. **Second pass (d0276f428, pre-squash and bec926d1).** The census derived
+   each `lddw`'s high word from the instruction *index* rather than the
+   instruction's own address, which misattributes constants after any 16-byte
+   `lddw` pair; and its error-constant scan covered only `lddw`/`mov`,
+   missing the store-immediate codes entirely. This inflated the "error
+   sentinel" story to six sites and hid the real finding. Both fixed here; the
+   bit-63 error-ABI hypothesis is retracted.
 
 ## Tool (Rust, zero dependencies)
 
@@ -43,8 +35,10 @@ The erroneous "SBF ALU128 reassignment" claim is retracted in full.
   `lddw` paired) and **refuses to census a window that contains an opcode
   outside its tables** instead of guessing;
 - classifies compare-guarded checked arithmetic, saturating skip-guards,
-  division sites, error-code immediates and 32-bit `lddw` constants;
-- writes the listing and census JSON directly (no shell redirection).
+  division sites, and error-code immediates via `lddw`, `mov` **and the store
+  family** (`stw`/`stdw`/`stb`/`sth`);
+- writes the listing and census JSON directly (no shell redirection); two
+  consecutive runs are byte-identical.
 
 Regeneration from `tool/`:
 
@@ -56,7 +50,24 @@ cargo run --release -- ../../../../../../evidence/original/pump/deployed.so \
 
 ## Findings
 
-1. **The original's overflow-checked arithmetic in this window is
+1. **The original raises three PumpError variants that the reconstruction
+   never raises anywhere.** The window builds four error values as
+   store-immediates in the standard 6000+N range:
+   - `0x780b8`: `stw [r10-568], 6064` → `InvalidQuoteTokenProgram` (6064−6000)
+   - `0x78260`: `stw [r10-568], 6010` → `AccountTypeNotSupported`
+   - `0x78c58`: `stw [r10-568], 6076` → `InvalidCashbackRecipient`
+   - `0x795e0`: `stw [r10-568], 6010` → `AccountTypeNotSupported` (second site)
+   Each store sits inside an error-object construction that also stores
+   call-site location metadata (e.g. `stb 2; stw 305; stdw 60` at `0x780c0`
+   — line 305, column 60; `stw 342` at `0x78c40` — line 342, column 60),
+   consistent with anchor `error!()` construction. A repository-wide grep
+   finds `AccountTypeNotSupported`, `InvalidQuoteTokenProgram` and
+   `InvalidCashbackRecipient` **only in the enum definition** — no source
+   raises them — so the original's `migrate_v2::execute` performs three
+   validations the reconstruction does not implement. This is a concrete
+   semantic gap and a structural part of the 0.201 similarity; locating the
+   exact checked conditions is the follow-up.
+2. **The original's overflow-checked arithmetic in this window is
    compare-guarded, matching the reconstruction's combinator style.** Exactly
    two sites carry the guard shape:
    - `0x78e18`: `add r6, r1` guarded by `jlt r6, r0, +1` at `0x78e28` — a u64
@@ -67,21 +78,6 @@ cargo run --release -- ../../../../../../evidence/original/pump/deployed.so \
    The source expresses three checked operations in `execute` (one add, two
    sub); the third's lowering does not use this guard shape within the census
    window and is flagged for follow-up rather than claimed.
-2. **Error constants use a bit-63 form, not the 6000+N range.** The window
-   contains no immediate in [6000,7000) via `lddw` or `mov`. Instead it
-   repeatedly compares values against `0x800000000000001A` (= 2^63+26, six
-   `jeq` sites, e.g. `0x77f08`) and `0x8000000000000017` (= 2^63+23, two
-   sites), and separately loads the bare constants 23 (`0x78ed0`, `0x78740`)
-   and 26 (`0x79830`, `0x78818` and others) whose values match the sentinel
-   low halves. Hypothesis, labeled as such: the original custom-error ABI
-   flags program errors with bit 63 and carries the variant index; under the
-   reconstructed enum's order (77 variants, `lib.rs`), index 23 is
-   `NotEnoughTokensToSell` and index 26 is `DivisionByZero` — the same order
-   convention the recovered constant-product fragment confirms for its own
-   window (6024=Overflow, 6026=DivisionByZero). Five sentinel checks against
-   DivisionByZero with zero division instructions in the window are consistent
-   with zero-denominator pre-checks before delegating to helpers that divide.
-   Confirming the ABI belongs to callee-window work.
 3. **No division, modulus or 64-bit multiplication anywhere** in the window,
    so the migration math performs no curve recomputation — consistent with the
    source, which only adds/subtracts and delegates pool creation to the
@@ -90,9 +86,13 @@ cargo run --release -- ../../../../../../evidence/original/pump/deployed.so \
    saturating_sub sites of the source live in `init_pump_amm_boost_v2`, which
    is `#[inline(never)]` with its own window — their absence here is
    consistent, not a discrepancy.
-5. 34 `lddw` constants total: the two error sentinels above plus 18 distinct
-   values in the 0x1b5xxx–0x1bdxxx range (uninterpreted — Anchor
-   discriminators/hashes by shape).
+5. 34 `lddw` instructions carry 18 distinct 32-bit values: 16 values in the
+   0x1b5xxx–0x1bdxxx range (uninterpreted — Anchor discriminators/hashes by
+   shape) plus two full 64-bit constants whose low halves are 0x1a and 0x17:
+   `0x800000000000001a` at `0x77ef8` and `0x8000000000000017` at `0x78740`,
+   each compared by a following `jeq` (register form). Their purpose is
+   **uninterpreted** — they are not error codes (the error codes are the
+   store-immediates above), and no higher-level meaning is claimed.
 
 ## Comparison table
 
@@ -102,14 +102,14 @@ cargo run --release -- ../../../../../../evidence/original/pump/deployed.so \
 | `checked_sub(fee)` (native), `checked_sub(quote_before)` | one guard-shaped checked sub at `0x786d0`; the second sub's shape unresolved here |
 | `saturating_sub` ×2 in `init_pump_amm_boost_v2` | absent — consistent (`#[inline(never)]` helper, own window) |
 | no division in `execute` | zero div/mod/mul64 sites |
-| `error!(PumpError::…)` variants | no 6000+N immediates; bit-63 sentinel comparisons against variant indices 23/26 (hypothesis) |
+| (no occurrences of `AccountTypeNotSupported`, `InvalidQuoteTokenProgram`, `InvalidCashbackRecipient` in source) | three variants constructed at four sites with location metadata — a missing-validation gap |
 
 ## Limits
 
 Static census of one window of the committed capture; nothing is executed and
 no SBF build is performed. Window bounds from
 `reconstruction/pump-main/prior-swarm/TARGETS-20261029.json`; similarity 0.201
-quoted from `reconstruction/pump-main/lanes/callgraph-census`. The bit-63
-error-ABI reading is a labeled hypothesis; the 0x1b5xxx constants and the
-exact callee attribution are uninterpreted. This lane makes no equivalence or
-security claim.
+quoted from `reconstruction/pump-main/lanes/callgraph-census`. The purpose of
+the two full 64-bit `jeq` constants and the 0x1b5xxx range is uninterpreted,
+and the exact checked conditions behind the three missing validations are not
+reconstructed here. This lane makes no equivalence or security claim.
